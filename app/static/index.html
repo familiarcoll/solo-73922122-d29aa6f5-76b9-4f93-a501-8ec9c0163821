@@ -96,7 +96,17 @@
           <thead><tr><th>任务</th><th>粒度</th><th>配置版本</th><th>描述</th><th></th></tr></thead>
           <tbody id="task-rows"></tbody>
         </table>
-        <p class="hint">修改粒度、增删依赖会使该任务配置版本 +1，旧版本的成功记录将变为「版本过期」。</p>
+        <p class="hint">修改粒度、增删依赖会使该任务配置版本 +1，旧版本的成功记录将变为「版本过期」；只改说明不影响版本。</p>
+        <div id="edit-box" style="display:none; margin-top:12px; border-top:1px solid var(--border); padding-top:12px">
+          <h2 style="font-size:14px">编辑说明：<code id="e-name"></code>
+            <span class="hint">（依据配置版本 <span id="e-ver"></span>）</span></h2>
+          <div class="form-row">
+            <input id="e-desc" placeholder="任务说明" style="flex:1; min-width:260px">
+            <button onclick="saveDesc()">保存说明</button>
+            <button class="ghost" onclick="closeEdit()">取消</button>
+          </div>
+          <p class="hint">保存说明只更新描述，不会改变粒度与配置版本；若期间配置被他人修改将安全合并。</p>
+        </div>
       </div>
       <div class="panel">
         <h2>任务依赖（下游 ← 上游，跨日偏移）</h2>
@@ -203,9 +213,43 @@ function renderTasks() {
     <td>${t.granularity === 'daily' ? '日' : '小时'}</td>
     <td><span class="tag ver">v${t.config_version}</span></td>
     <td>${t.description || ''}</td>
-    <td><button class="ghost" onclick="bumpGran(${t.id},'${t.granularity}')">切换粒度</button>
+    <td><button class="ghost" onclick="openEdit(${t.id})">编辑说明</button>
+        <button class="ghost" onclick="bumpGran(${t.id})">切换粒度</button>
         <button class="ghost" onclick="delTask(${t.id})">删除</button></td>
   </tr>`).join('');
+}
+/* 编辑说明：打开时记下所依据的配置版本，保存时只做安全合并 */
+let editing = null;  // {id, base_version}
+function openEdit(id) {
+  const t = state.tasks.find(x => x.id === id);
+  if (!t) return;
+  editing = {id, base_version: t.config_version};
+  $('#e-name').textContent = t.name;
+  $('#e-ver').textContent = 'v' + t.config_version;
+  $('#e-desc').value = t.description || '';
+  $('#edit-box').style.display = 'block';
+  $('#e-desc').focus();
+}
+function closeEdit() { editing = null; $('#edit-box').style.display = 'none'; }
+async function saveDesc() {
+  if (!editing) return;
+  try {
+    const t = await api(`/api/tasks/${editing.id}`, {method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({description: $('#e-desc').value,
+                            base_version: editing.base_version})});
+    showMsg(`说明已保存（粒度与版本不变，仍为 v${t.config_version}）`);
+    closeEdit(); refresh();
+  } catch (e) { handleConflict(e); }
+}
+/* 409 冲突：提示并刷新到最新状态，可据此重试 */
+function handleConflict(e) {
+  if (e.status === 409 && e.payload && e.payload.task) {
+    showMsg('冲突：' + e.payload.reason, true);
+    closeEdit(); refresh();
+  } else {
+    showMsg(e.body, true);
+  }
 }
 function renderDeps() {
   $('#dep-rows').innerHTML = state.dependencies.map(d => `<tr>
@@ -228,13 +272,22 @@ async function addTask() {
     showMsg('任务已创建'); refresh();
   } catch (e) { showMsg(e.body, true); }
 }
-async function bumpGran(id, cur) {
+async function bumpGran(id) {
+  const t = state.tasks.find(x => x.id === id);
+  if (!t) return;
+  const target = t.granularity === 'daily' ? 'hourly' : 'daily';
+  const before = t.config_version;
   try {
-    await api(`/api/tasks/${id}`, {method: 'PUT',
+    const resp = await api(`/api/tasks/${id}`, {method: 'PUT',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({granularity: cur === 'daily' ? 'hourly' : 'daily'})});
-    showMsg('粒度已切换，配置版本 +1'); refresh();
-  } catch (e) { showMsg(e.body, true); }
+      body: JSON.stringify({granularity: target, base_version: before})});
+    if (resp.config_version > before) {
+      showMsg(`粒度已切换，配置版本 v${before} → v${resp.config_version}`);
+    } else {
+      showMsg(`粒度已是目标值（当前 v${resp.config_version}），未重复升版本`);
+    }
+    refresh();
+  } catch (e) { handleConflict(e); }
 }
 async function delTask(id) {
   if (!confirm('删除任务将级联删除其依赖与运行记录，确认？')) return;

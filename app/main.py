@@ -39,6 +39,8 @@ class TaskIn(BaseModel):
 class TaskUpdate(BaseModel):
     granularity: str | None = Field(default=None, pattern="^(daily|hourly)$")
     description: str | None = None
+    # 客户端开始编辑时看到的配置版本（乐观锁）；缺省表示不校验
+    base_version: int | None = Field(default=None, ge=1)
 
 
 class DepIn(BaseModel):
@@ -104,19 +106,48 @@ def create_task(body: TaskIn):
 
 @app.put("/api/tasks/{task_id}")
 def update_task(task_id: int, body: TaskUpdate):
+    """编辑任务（说明 / 粒度），并发安全：
+
+    - 整个 读-判-写 在 BEGIN IMMEDIATE 写事务内串行执行，
+      不会读到旧值后覆盖他人已提交的修改（丢失更新）；
+    - 只改说明：仅写 description 列，已提交的粒度与配置版本原样保留，
+      与并发的依赖增删/粒度切换安全合并；
+    - 粒度按实际配置变化递增版本：以当前提交值原子 +1（SQL 相对自增），
+      目标粒度与当前一致时不递增；
+    - base_version 与当前版本不一致（编辑依据的配置已被其他请求改动）
+      且本次要变更粒度：返回 409 可重试冲突，事务回滚，不留部分状态。
+    """
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         task = conn.execute("SELECT * FROM tasks WHERE id = ?",
                             (task_id,)).fetchone()
         if not task:
             raise HTTPException(404, "任务不存在")
-        desc = body.description if body.description is not None else task["description"]
-        gran = body.granularity or task["granularity"]
-        # 粒度属于配置：变更即升版本，使旧运行记录过期
-        ver = task["config_version"] + 1 if gran != task["granularity"] \
-            else task["config_version"]
-        conn.execute(
-            "UPDATE tasks SET granularity = ?, description = ?, config_version = ?"
-            " WHERE id = ?", (gran, desc, ver, task_id))
+        cur_ver = task["config_version"]
+        new_desc = body.description if body.description is not None \
+            else task["description"]
+        new_gran = body.granularity if body.granularity is not None \
+            else task["granularity"]
+        gran_changed = new_gran != task["granularity"]
+        stale_basis = body.base_version is not None and body.base_version != cur_ver
+        if stale_basis and gran_changed:
+            # 依据的配置已被改动且本次要改配置：拒绝并携带当前状态，可刷新重试
+            current = rows(conn, "SELECT * FROM tasks WHERE id = ?", (task_id,))[0]
+            raise HTTPException(409, detail={
+                "reason": f"任务[{task['name']}]的配置已被他人修改"
+                          f"（编辑依据 v{body.base_version}，当前 v{cur_ver}），"
+                          "请刷新后重试",
+                "task": current})
+        if gran_changed:
+            # 粒度属于配置：基于当前提交值原子升版本，使旧运行记录过期
+            conn.execute(
+                "UPDATE tasks SET granularity = ?, description = ?,"
+                " config_version = config_version + 1 WHERE id = ?",
+                (new_gran, new_desc, task_id))
+        else:
+            # 仅说明变化：不动粒度与版本，安全合并他人已提交的配置变更
+            conn.execute("UPDATE tasks SET description = ? WHERE id = ?",
+                         (new_desc, task_id))
         return rows(conn, "SELECT * FROM tasks WHERE id = ?", (task_id,))[0]
 
 
@@ -138,6 +169,7 @@ def create_dep(body: DepIn):
     if body.downstream_id == body.upstream_id:
         raise HTTPException(400, "不允许任务依赖自身")
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")  # 检查+写入+升版本整体原子
         found = conn.execute(
             "SELECT COUNT(*) AS c FROM tasks WHERE id IN (?, ?)",
             (body.downstream_id, body.upstream_id)).fetchone()["c"]
@@ -158,6 +190,7 @@ def create_dep(body: DepIn):
 @app.delete("/api/dependencies/{dep_id}", status_code=204)
 def delete_dep(dep_id: int):
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")  # 读取+删除+升版本整体原子
         dep = conn.execute("SELECT * FROM dependencies WHERE id = ?",
                            (dep_id,)).fetchone()
         if not dep:
